@@ -193,4 +193,13 @@ SPECTRUM_F_MAX: Final[int] = 20000
 # its last measured time.
 ENTITY_LATENCY_SAFETY_FACTOR: Final[float] = 1.3
 # How fast the per-entity round-trip estimate adapts to new samples.
+#
+# Currently unused: bridge.py's _send_command switched from call_service()
+# to send_command_no_wait() (see that method's docstring) because the
+# round trip this constant was meant to smooth out turned out to measure
+# hass_client's ack-matching delay, not the light's own real latency - and
+# the no-wait call doesn't produce a meaningful elapsed time to feed this
+# at all. Left in place (not deleted) in case a real per-light latency
+# signal - e.g. from the light's own state-change event timing, rather
+# than the service-call ack - ever replaces it.
 ENTITY_LATENCY_EMA_ALPHA: Final[float] = 0.3

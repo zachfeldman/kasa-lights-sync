@@ -54,7 +54,6 @@ from .analyzer import HALightsAudioAnalyzer
 from .const import (
     CALL_SERVICE_TIMEOUT_S,
     DEFAULT_RESTORE_ON_STOP,
-    ENTITY_LATENCY_EMA_ALPHA,
     ENTITY_LATENCY_SAFETY_FACTOR,
     RENDER_PERIOD_S,
     RESTORE_TRANSITION_S,
@@ -724,16 +723,73 @@ class HALightGroupBridge:
         )
 
     async def _send_command(self, entity_id: str, command: LightCommand) -> None:
+        """
+        Fire one light.turn_on for a render frame - without waiting for HA's ack.
+
+        Real-hardware session (Oct 30 2026, debug heartbeat logging from
+        _dispatch_send/_render_tick enabled throughout): confirmed the
+        "wedges deep inside hass_client/aiohttp" theory in this method's
+        previous version was half right and half wrong. Over a ~12 minute
+        capture, _send_command's own success log ("light.turn_on for %s
+        took %dms") and its failure log never fired ONCE for either
+        configured light, which looked like a fully dead render loop - but
+        the lights' real HA state *did* occasionally change color during
+        the same window, several minutes apart, proving the light.turn_on
+        calls were actually reaching Home Assistant and executing. The
+        previous version's "stuck for over 3s" escape hatch fired only
+        twice in those 12 minutes, nowhere near often enough to explain
+        hundreds of "still in flight" skips.
+
+        That combination only makes sense one way: call_service()'s
+        `await` wasn't stuck on the outbound write (that part was fine -
+        commands were visibly landing), it was stuck waiting on hass_client's
+        matching "result" message - see HomeAssistantClient.send_command,
+        which parks a Future per request and only resolves it when a
+        message with the matching id arrives off this server's ONE shared
+        websocket connection to HA. With ~2600 entities and this server's
+        own `subscribe_entities`/state churn sharing that same socket, a
+        result message for one light.turn_on can end up queued behind a
+        large backlog of unrelated traffic - the command itself goes out
+        and HA executes it promptly, but the *acknowledgement* can take
+        minutes to come back around, if it ever does before something else
+        reaps the Future. The old age-based "assume stuck, cancel and
+        re-send" logic in _dispatch_send was reacting to exactly this
+        delayed-ack symptom as if it were a wedged call, firing a
+        replacement that then itself waited on the same backlogged queue -
+        not a retry storm (only one send per entity is ever in flight by
+        design), but also not a fix, since every replacement has the same
+        chance of landing behind the same backlog.
+
+        Fix: use send_command_no_wait() instead of call_service(). It still
+        sends the identical "call_service" websocket message (same
+        domain/service/service_data/target), but returns as soon as the
+        message is written to the socket, with no Future parked waiting on
+        a "result" reply this code was never actually using for anything
+        (a dropped/delayed ack was only ever read as a timing signal, never
+        used to validate or retry the *content* of a failed call). This
+        sidesteps the backlog entirely for the one call site that fires
+        many times per second and therefore felt it the worst - restore/
+        flash-confirmation (_restore_pre_sync_state, _send_flash_white)
+        still use call_service, since those are rare, one-shot calls where
+        knowing the result is more useful than saving a wait.
+
+        One real cost: _entity_latency_ms (the per-light adaptive-pacing
+        EMA fed by this method's old timing block) no longer measures
+        anything meaningful - send_command_no_wait returns almost
+        instantly regardless of how slow the light actually is downstream,
+        so it would always read as "fast". Left unfed (not fed a fake
+        near-zero number) rather than deleted outright, since
+        _dispatch_send's consumer of it already treats "no sample yet" as
+        "don't throttle" - the correct behavior now that this method can't
+        supply a real one.
+        """
         if self._hass is None:
             return
-        # Timing logged at DEBUG since this is the expected-success path
-        # (every render tick hits it); _dispatch_send's wall-clock check is
-        # what actually guards against this never returning at all.
-        start = time.monotonic()
         try:
-            await self._hass.call_service(
-                "light",
-                "turn_on",
+            await self._hass.send_command_no_wait(
+                "call_service",
+                domain="light",
+                service="turn_on",
                 service_data={
                     "hs_color": [command.hue, command.saturation],
                     "brightness_pct": command.brightness,
@@ -746,24 +802,15 @@ class HALightGroupBridge:
                 },
                 target={"entity_id": entity_id},
             )
-            elapsed_ms = round((time.monotonic() - start) * 1000)
-            self.logger.debug("light.turn_on for %s took %dms", entity_id, elapsed_ms)
-            # Only successful, non-stuck calls feed the pacing estimate - a
-            # single stuck/failed call (handled separately above/below)
-            # shouldn't permanently convince us this entity is slower than
-            # it normally is off one bad sample.
-            prev = self._entity_latency_ms.get(entity_id)
-            self._entity_latency_ms[entity_id] = (
-                elapsed_ms if prev is None
-                else prev + ENTITY_LATENCY_EMA_ALPHA * (elapsed_ms - prev)
-            )
+            self.logger.debug("light.turn_on dispatched (no-wait) for %s", entity_id)
         except asyncio.CancelledError:
             # Raised into us by _dispatch_send's best-effort pending.cancel()
-            # above, potentially long after this coroutine actually wedged -
-            # not a real cancellation of the request in flight, just us
-            # giving up on waiting for it. Swallowed on purpose: the stuck
-            # call is already being treated as abandoned by the time this
-            # fires, so there is nothing left to report.
+            # above. Far less likely to matter now - send_command_no_wait's
+            # own await (writing to the socket) should resolve quickly - but
+            # kept as a safety net in case the write itself ever blocks (a
+            # genuinely congested/broken socket, as opposed to a backlogged
+            # read queue). Swallowed on purpose: there is nothing left to
+            # report once we've given up on this send.
             pass
         except Exception:
             self.logger.debug(
